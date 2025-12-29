@@ -242,44 +242,51 @@ def get_gamemode_display(gamemode: str) -> str:
     return next((gm for gm in GAMEMODES if gm.lower() == gamemode.lower()), gamemode)
 
 
-async def create_queue_embed(guild: discord.Guild, gamemode: str, region: str) -> discord.Embed:
-    """Create the queue panel embed."""
+def create_closed_queue_embed(gamemode: str, region: str) -> discord.Embed:
+    """Create a CLOSED queue panel embed."""
+    gamemode_display = get_gamemode_display(gamemode)
+
+    embed = discord.Embed(
+        title=f"🔒 {gamemode_display} Queue Closed",
+        description="This testing session has ended.\nYou will be notified here when a new queue opens.",
+        color=discord.Color.dark_gray(),
+    )
+    embed.add_field(
+        name="📋 Reason",
+        value="Manually closed by queue administrator",
+        inline=False,
+    )
+    embed.add_field(
+        name="⏰ Session Ended",
+        value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:F>",
+        inline=False,
+    )
+    embed.set_footer(text=f"Thank you for testing! | 🌍 Region: {region}")
+
+    return embed
+
+
+def create_open_queue_embed(guild: discord.Guild, gamemode: str, region: str) -> discord.Embed:
+    """Create an OPEN queue panel embed."""
     gamemode_display = get_gamemode_display(gamemode)
     queue = get_queue(gamemode, region)
     testers = get_active_testers(gamemode, region)
     pulled = get_pulled_user(gamemode, region)
 
     embed = discord.Embed(
-        title=f"🎮 {gamemode_display} Queue — {region}",
-        color=discord.Color.green() if testers else discord.Color.red(),
+        title=f"✅ {gamemode_display} Tester Available!",
+        description="The queue is now open and updates in real-time.",
+        color=discord.Color.green(),
     )
-
-    # Active Testers
-    if testers:
-        tester_mentions = []
-        for tid in testers:
-            member = guild.get_member(tid)
-            tester_mentions.append(member.mention if member else f"<@{tid}>")
-        embed.add_field(
-            name="🧪 Active Testers",
-            value="\n".join(tester_mentions),
-            inline=False,
-        )
-    else:
-        embed.add_field(
-            name="🧪 Active Testers",
-            value="*No testers online*",
-            inline=False,
-        )
 
     # Queue List
     if queue:
         queue_lines = []
         for i, uid in enumerate(queue, 1):
             member = guild.get_member(uid)
-            name = member.display_name if member else f"User {uid}"
+            mention = member.mention if member else f"<@{uid}>"
             pulled_marker = " 🔒" if pulled == uid else ""
-            queue_lines.append(f"`{i}.` {name}{pulled_marker}")
+            queue_lines.append(f"`{i}.` {mention}{pulled_marker}")
         embed.add_field(
             name=f"📋 Queue ({len(queue)})",
             value="\n".join(queue_lines[:15]) + ("\n..." if len(queue) > 15 else ""),
@@ -287,24 +294,48 @@ async def create_queue_embed(guild: discord.Guild, gamemode: str, region: str) -
         )
     else:
         embed.add_field(
-            name="📋 Queue (0)",
+            name="📋 Queue",
             value="*Queue is empty*",
             inline=False,
         )
 
-    # Timestamp
-    embed.set_footer(text=f"Last refreshed: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
+    # Active Testers
+    if testers:
+        tester_lines = []
+        for i, tid in enumerate(testers, 1):
+            member = guild.get_member(tid)
+            tester_lines.append(f"{i}. {member.mention if member else f'<@{tid}>'}")
+        embed.add_field(
+            name="🎮 Active Testers",
+            value="\n".join(tester_lines),
+            inline=False,
+        )
+
+    embed.set_footer(text=f"🌍 Region: {region} | ⏱ Last Updated: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
 
     return embed
+
+
+async def create_queue_embed(guild: discord.Guild, gamemode: str, region: str) -> discord.Embed:
+    """Create the queue panel embed based on state."""
+    testers = get_active_testers(gamemode, region)
+    if testers:
+        return create_open_queue_embed(guild, gamemode, region)
+    else:
+        return create_closed_queue_embed(gamemode, region)
 
 
 class QueueView(ui.View):
     """Persistent view for queue panel with Join/Leave buttons."""
 
-    def __init__(self, gamemode: str, region: str):
+    def __init__(self, gamemode: str, region: str, disabled: bool = False):
         super().__init__(timeout=None)
         self.gamemode = gamemode
         self.region = region
+        # Update button states
+        for child in self.children:
+            if isinstance(child, ui.Button):
+                child.disabled = disabled
 
     @ui.button(
         label="Join Queue",
@@ -313,6 +344,15 @@ class QueueView(ui.View):
         emoji="✅",
     )
     async def join_button(self, interaction: discord.Interaction, button: ui.Button):
+        # Check if testers are online
+        testers = get_active_testers(self.gamemode, self.region)
+        if not testers:
+            await interaction.response.send_message(
+                "❌ Queue is closed. No tester is currently online.",
+                ephemeral=True,
+            )
+            return
+
         # Check if user has waitlist role
         if not has_waitlist_role(interaction.user, self.gamemode):
             await interaction.response.send_message(
@@ -723,27 +763,25 @@ async def start_queue(interaction: discord.Interaction, gamemode: str, region: s
         )
         return
 
-    # Update or create queue panel
+    # Update the existing panel (or create if missing)
     key = get_queue_key(gamemode, region)
     embed = await create_queue_embed(interaction.guild, gamemode, region)
-    view = QueueView(gamemode.lower(), region)
+    view = QueueView(gamemode.lower(), region, disabled=False)
 
-    # Try to find existing panel message
     panel_msg_id = queue_panel_messages.get(key)
+    ping_content = f"@here A **{gamemode_display}** queue is open for the **{region}** region!"
+
     if panel_msg_id:
         try:
             msg = await channel.fetch_message(panel_msg_id)
-            await msg.edit(embed=embed, view=view)
+            await msg.edit(content=ping_content, embed=embed, view=view)
         except discord.NotFound:
-            panel_msg_id = None
-
-    if not panel_msg_id:
-        # Send new panel with @here ping
-        msg = await channel.send(
-            content=f"@here 🧪 **{gamemode_display} ({region})** queue is now **OPEN**!",
-            embed=embed,
-            view=view,
-        )
+            # Panel was deleted, create new one
+            msg = await channel.send(content=ping_content, embed=embed, view=view)
+            queue_panel_messages[key] = msg.id
+    else:
+        # No panel exists, create one
+        msg = await channel.send(content=ping_content, embed=embed, view=view)
         queue_panel_messages[key] = msg.id
 
     await interaction.response.send_message(
@@ -752,7 +790,7 @@ async def start_queue(interaction: discord.Interaction, gamemode: str, region: s
     )
 
 
-async def end_queue(interaction: discord.Interaction, gamemode: str, region: str):
+async def end_queue(interaction: discord.Interaction, gamemode: str, region: str, clear_queue: bool = False):
     """End queue activity for a tester."""
     gamemode_display = get_gamemode_display(gamemode)
 
@@ -774,6 +812,13 @@ async def end_queue(interaction: discord.Interaction, gamemode: str, region: str
 
     testers.remove(interaction.user.id)
 
+    # If no testers left, close the queue
+    if not testers:
+        # Clear the queue when closing
+        queue = get_queue(gamemode, region)
+        queue.clear()
+        set_pulled_user(gamemode, region, None)
+
     # Update queue panel
     key = get_queue_key(gamemode, region)
     channel_name = f"waitlist-{gamemode.lower()}"
@@ -785,8 +830,10 @@ async def end_queue(interaction: discord.Interaction, gamemode: str, region: str
             try:
                 msg = await channel.fetch_message(panel_msg_id)
                 embed = await create_queue_embed(interaction.guild, gamemode, region)
-                view = QueueView(gamemode.lower(), region)
-                await msg.edit(embed=embed, view=view)
+                # Disable buttons if no testers left
+                is_closed = len(get_active_testers(gamemode, region)) == 0
+                view = QueueView(gamemode.lower(), region, disabled=is_closed)
+                await msg.edit(content=None, embed=embed, view=view)
             except discord.NotFound:
                 pass
 
@@ -796,47 +843,47 @@ async def end_queue(interaction: discord.Interaction, gamemode: str, region: str
     )
 
 
-# Slash commands for starting queues
-@bot.tree.command(name="start-na", description="Start testing for NA region")
+# Slash commands for starting queues (renamed to /na-start, /eu-start, /as-start)
+@bot.tree.command(name="na-start", description="Start testing for NA region")
 @app_commands.describe(gamemode="The gamemode to start testing")
 @app_commands.choices(gamemode=[app_commands.Choice(name=gm, value=gm.lower()) for gm in GAMEMODES])
-async def start_na(interaction: discord.Interaction, gamemode: app_commands.Choice[str]):
+async def na_start(interaction: discord.Interaction, gamemode: app_commands.Choice[str]):
     await start_queue(interaction, gamemode.value, "NA")
 
 
-@bot.tree.command(name="start-eu", description="Start testing for EU region")
+@bot.tree.command(name="eu-start", description="Start testing for EU region")
 @app_commands.describe(gamemode="The gamemode to start testing")
 @app_commands.choices(gamemode=[app_commands.Choice(name=gm, value=gm.lower()) for gm in GAMEMODES])
-async def start_eu(interaction: discord.Interaction, gamemode: app_commands.Choice[str]):
+async def eu_start(interaction: discord.Interaction, gamemode: app_commands.Choice[str]):
     await start_queue(interaction, gamemode.value, "EU")
 
 
-@bot.tree.command(name="start-as", description="Start testing for AS/AU region")
+@bot.tree.command(name="as-start", description="Start testing for AS/AU region")
 @app_commands.describe(gamemode="The gamemode to start testing")
 @app_commands.choices(gamemode=[app_commands.Choice(name=gm, value=gm.lower()) for gm in GAMEMODES])
-async def start_as(interaction: discord.Interaction, gamemode: app_commands.Choice[str]):
+async def as_start(interaction: discord.Interaction, gamemode: app_commands.Choice[str]):
     await start_queue(interaction, gamemode.value, "AS")
 
 
-# Slash commands for ending queues
-@bot.tree.command(name="end-na", description="End testing for NA region")
+# Slash commands for ending queues (renamed to /na-end, /eu-end, /as-end)
+@bot.tree.command(name="na-end", description="End testing for NA region")
 @app_commands.describe(gamemode="The gamemode to stop testing")
 @app_commands.choices(gamemode=[app_commands.Choice(name=gm, value=gm.lower()) for gm in GAMEMODES])
-async def end_na(interaction: discord.Interaction, gamemode: app_commands.Choice[str]):
+async def na_end(interaction: discord.Interaction, gamemode: app_commands.Choice[str]):
     await end_queue(interaction, gamemode.value, "NA")
 
 
-@bot.tree.command(name="end-eu", description="End testing for EU region")
+@bot.tree.command(name="eu-end", description="End testing for EU region")
 @app_commands.describe(gamemode="The gamemode to stop testing")
 @app_commands.choices(gamemode=[app_commands.Choice(name=gm, value=gm.lower()) for gm in GAMEMODES])
-async def end_eu(interaction: discord.Interaction, gamemode: app_commands.Choice[str]):
+async def eu_end(interaction: discord.Interaction, gamemode: app_commands.Choice[str]):
     await end_queue(interaction, gamemode.value, "EU")
 
 
-@bot.tree.command(name="end-as", description="End testing for AS/AU region")
+@bot.tree.command(name="as-end", description="End testing for AS/AU region")
 @app_commands.describe(gamemode="The gamemode to stop testing")
 @app_commands.choices(gamemode=[app_commands.Choice(name=gm, value=gm.lower()) for gm in GAMEMODES])
-async def end_as(interaction: discord.Interaction, gamemode: app_commands.Choice[str]):
+async def as_end(interaction: discord.Interaction, gamemode: app_commands.Choice[str]):
     await end_queue(interaction, gamemode.value, "AS")
 
 
@@ -1068,6 +1115,34 @@ async def next_user(
 # BOT EVENTS & PANEL COMMANDS
 # ============================================================
 
+async def initialize_queue_panels(guild: discord.Guild):
+    """Initialize closed queue panels in all waitlist channels on startup."""
+    for gm in GAMEMODES:
+        channel_name = f"waitlist-{gm.lower()}"
+        channel = discord.utils.get(guild.text_channels, name=channel_name)
+
+        if channel is None:
+            continue
+
+        for reg in REGIONS:
+            key = get_queue_key(gm, reg)
+
+            # Skip if we already have a panel for this combo
+            if key in queue_panel_messages:
+                continue
+
+            # Create closed panel
+            embed = create_closed_queue_embed(gm, reg)
+            view = QueueView(gm.lower(), reg, disabled=True)
+
+            try:
+                msg = await channel.send(embed=embed, view=view)
+                queue_panel_messages[key] = msg.id
+                print(f"Created panel for {gm} ({reg}) in #{channel_name}")
+            except discord.Forbidden:
+                print(f"Cannot send to #{channel_name}")
+
+
 @bot.event
 async def on_ready():
     print(f"Bot is ready: {bot.user}")
@@ -1076,7 +1151,8 @@ async def on_ready():
     # Register queue views for all gamemode/region combos
     for gm in GAMEMODES:
         for reg in REGIONS:
-            bot.add_view(QueueView(gm.lower(), reg))
+            bot.add_view(QueueView(gm.lower(), reg, disabled=True))
+            bot.add_view(QueueView(gm.lower(), reg, disabled=False))
 
     # Sync slash commands
     try:
@@ -1084,6 +1160,10 @@ async def on_ready():
         print(f"Synced {len(synced)} slash command(s)")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
+
+    # Initialize panels in all guilds
+    for guild in bot.guilds:
+        await initialize_queue_panels(guild)
 
 
 @bot.command(name="panel")
@@ -1102,30 +1182,195 @@ async def slash_panel(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=view)
 
 
-@bot.tree.command(name="queue", description="Post queue panel in current channel")
+# ============================================================
+# ADMIN COMMANDS
+# ============================================================
+
+def is_admin(member: discord.Member) -> bool:
+    """Check if member has admin permissions."""
+    admin_roles = ["Admin", "Administrator", "Manager", "Head Tester"]
+    return any(role.name in admin_roles for role in member.roles) or member.guild_permissions.administrator
+
+
+@bot.tree.command(name="status", description="Check queue status")
 @app_commands.describe(gamemode="The gamemode", region="The region (NA/EU/AS)")
 @app_commands.choices(
     gamemode=[app_commands.Choice(name=gm, value=gm.lower()) for gm in GAMEMODES],
     region=[app_commands.Choice(name=r, value=r) for r in REGIONS],
 )
-async def post_queue(
+async def queue_status(
     interaction: discord.Interaction,
     gamemode: app_commands.Choice[str],
     region: app_commands.Choice[str],
 ):
-    """Post a queue panel for a specific gamemode and region."""
+    """Show tester online/offline status and queue size."""
     gm = gamemode.value
     reg = region.value
+    gamemode_display = get_gamemode_display(gm)
 
-    embed = await create_queue_embed(interaction.guild, gm, reg)
-    view = QueueView(gm, reg)
+    testers = get_active_testers(gm, reg)
+    queue = get_queue(gm, reg)
 
-    await interaction.response.send_message(embed=embed, view=view)
+    status = "🟢 OPEN" if testers else "🔴 CLOSED"
 
-    # Store message ID
-    msg = await interaction.original_response()
-    key = get_queue_key(gm, reg)
-    queue_panel_messages[key] = msg.id
+    embed = discord.Embed(
+        title=f"{gamemode_display} ({reg}) Status",
+        color=discord.Color.green() if testers else discord.Color.red(),
+    )
+    embed.add_field(name="Status", value=status, inline=True)
+    embed.add_field(name="Queue Size", value=str(len(queue)), inline=True)
+    embed.add_field(name="Active Testers", value=str(len(testers)), inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="force-open", description="[Admin] Force open a queue")
+@app_commands.describe(gamemode="The gamemode", region="The region", tester="Tester to add")
+@app_commands.choices(
+    gamemode=[app_commands.Choice(name=gm, value=gm.lower()) for gm in GAMEMODES],
+    region=[app_commands.Choice(name=r, value=r) for r in REGIONS],
+)
+async def force_open(
+    interaction: discord.Interaction,
+    gamemode: app_commands.Choice[str],
+    region: app_commands.Choice[str],
+    tester: discord.Member,
+):
+    """Admin force open a queue with a tester."""
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+        return
+
+    gm = gamemode.value
+    reg = region.value
+    gamemode_display = get_gamemode_display(gm)
+
+    testers = get_active_testers(gm, reg)
+    if tester.id not in testers:
+        testers.append(tester.id)
+
+    channel_name = f"waitlist-{gm}"
+    channel = discord.utils.get(interaction.guild.text_channels, name=channel_name)
+
+    if channel:
+        key = get_queue_key(gm, reg)
+        embed = await create_queue_embed(interaction.guild, gm, reg)
+        view = QueueView(gm, reg, disabled=False)
+        ping_content = f"@here A **{gamemode_display}** queue is open for the **{reg}** region!"
+
+        panel_msg_id = queue_panel_messages.get(key)
+        if panel_msg_id:
+            try:
+                msg = await channel.fetch_message(panel_msg_id)
+                await msg.edit(content=ping_content, embed=embed, view=view)
+            except discord.NotFound:
+                msg = await channel.send(content=ping_content, embed=embed, view=view)
+                queue_panel_messages[key] = msg.id
+        else:
+            msg = await channel.send(content=ping_content, embed=embed, view=view)
+            queue_panel_messages[key] = msg.id
+
+    await interaction.response.send_message(
+        f"✅ Force opened **{gamemode_display} ({reg})** with {tester.mention}.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="force-close", description="[Admin] Force close a queue")
+@app_commands.describe(gamemode="The gamemode", region="The region")
+@app_commands.choices(
+    gamemode=[app_commands.Choice(name=gm, value=gm.lower()) for gm in GAMEMODES],
+    region=[app_commands.Choice(name=r, value=r) for r in REGIONS],
+)
+async def force_close(
+    interaction: discord.Interaction,
+    gamemode: app_commands.Choice[str],
+    region: app_commands.Choice[str],
+):
+    """Admin force close a queue."""
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+        return
+
+    gm = gamemode.value
+    reg = region.value
+    gamemode_display = get_gamemode_display(gm)
+
+    # Clear testers and queue
+    testers = get_active_testers(gm, reg)
+    testers.clear()
+    queue = get_queue(gm, reg)
+    queue.clear()
+    set_pulled_user(gm, reg, None)
+
+    channel_name = f"waitlist-{gm}"
+    channel = discord.utils.get(interaction.guild.text_channels, name=channel_name)
+
+    if channel:
+        key = get_queue_key(gm, reg)
+        embed = create_closed_queue_embed(gm, reg)
+        view = QueueView(gm, reg, disabled=True)
+
+        panel_msg_id = queue_panel_messages.get(key)
+        if panel_msg_id:
+            try:
+                msg = await channel.fetch_message(panel_msg_id)
+                await msg.edit(content=None, embed=embed, view=view)
+            except discord.NotFound:
+                pass
+
+    await interaction.response.send_message(
+        f"✅ Force closed **{gamemode_display} ({reg})**.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="clear-queue", description="[Admin] Clear a queue without closing")
+@app_commands.describe(gamemode="The gamemode", region="The region")
+@app_commands.choices(
+    gamemode=[app_commands.Choice(name=gm, value=gm.lower()) for gm in GAMEMODES],
+    region=[app_commands.Choice(name=r, value=r) for r in REGIONS],
+)
+async def clear_queue_cmd(
+    interaction: discord.Interaction,
+    gamemode: app_commands.Choice[str],
+    region: app_commands.Choice[str],
+):
+    """Admin clear the queue."""
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+        return
+
+    gm = gamemode.value
+    reg = region.value
+    gamemode_display = get_gamemode_display(gm)
+
+    queue = get_queue(gm, reg)
+    cleared = len(queue)
+    queue.clear()
+    set_pulled_user(gm, reg, None)
+
+    # Update panel
+    channel_name = f"waitlist-{gm}"
+    channel = discord.utils.get(interaction.guild.text_channels, name=channel_name)
+
+    if channel:
+        key = get_queue_key(gm, reg)
+        panel_msg_id = queue_panel_messages.get(key)
+        if panel_msg_id:
+            try:
+                msg = await channel.fetch_message(panel_msg_id)
+                embed = await create_queue_embed(interaction.guild, gm, reg)
+                testers = get_active_testers(gm, reg)
+                view = QueueView(gm, reg, disabled=len(testers) == 0)
+                await msg.edit(embed=embed, view=view)
+            except discord.NotFound:
+                pass
+
+    await interaction.response.send_message(
+        f"✅ Cleared {cleared} user(s) from **{gamemode_display} ({reg})** queue.",
+        ephemeral=True,
+    )
 
 
 # ============================================================
