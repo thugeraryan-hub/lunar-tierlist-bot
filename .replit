@@ -27,3 +27,7 @@ args = "python backend/discord_bot.py"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[deployment]
+deploymentTarget = "vm"
+run = ["python", "backend/discord_bot.py"]
