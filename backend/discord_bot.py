@@ -75,6 +75,90 @@ RESULT_COOLDOWN_SECONDS = 30  # 30 second cooldown between results
 # Default Steve skin URL
 STEVE_SKIN_URL = "https://mc-heads.net/avatar/MHF_Steve/128"
 
+# ============================================================
+# TESTER STATS & STRIKE SYSTEM
+# ============================================================
+
+# Tester stats: {tester_id: {"tests": [(timestamp, duration), ...], "last_active": timestamp}}
+tester_stats: dict[int, dict] = {}
+
+# Strikes: {tester_id: [{"timestamp": float, "reason": str, "by": int}, ...]}
+tester_strikes: dict[int, list[dict]] = {}
+
+# Restrictions: {tester_id: restriction_end_timestamp}
+tester_restrictions: dict[int, float] = {}
+
+RESTRICTION_DAYS = 3
+MAX_STRIKES = 3
+
+
+def is_tester_restricted(tester_id: int) -> tuple[bool, int]:
+    """Check if tester is restricted. Returns (is_restricted, days_left)."""
+    if tester_id not in tester_restrictions:
+        return False, 0
+
+    end_time = tester_restrictions[tester_id]
+    now = time.time()
+
+    if now >= end_time:
+        # Restriction expired - remove and reset strikes
+        del tester_restrictions[tester_id]
+        if tester_id in tester_strikes:
+            tester_strikes[tester_id] = []
+        return False, 0
+
+    days_left = int((end_time - now) / 86400) + 1
+    return True, days_left
+
+
+def add_strike(tester_id: int, reason: str, by_id: int) -> int:
+    """Add a strike to a tester. Returns new strike count."""
+    if tester_id not in tester_strikes:
+        tester_strikes[tester_id] = []
+
+    tester_strikes[tester_id].append({
+        "timestamp": time.time(),
+        "reason": reason,
+        "by": by_id,
+    })
+
+    strike_count = len(tester_strikes[tester_id])
+
+    # Auto-restrict on 3 strikes
+    if strike_count >= MAX_STRIKES:
+        tester_restrictions[tester_id] = time.time() + (RESTRICTION_DAYS * 86400)
+
+    return strike_count
+
+
+def record_test(tester_id: int, duration: float = 0):
+    """Record a test completion for a tester."""
+    if tester_id not in tester_stats:
+        tester_stats[tester_id] = {"tests": [], "last_active": 0}
+
+    tester_stats[tester_id]["tests"].append((time.time(), duration))
+    tester_stats[tester_id]["last_active"] = time.time()
+
+
+def get_tester_stats(tester_id: int) -> dict:
+    """Get tester statistics."""
+    now = time.time()
+    month_ago = now - (30 * 86400)
+
+    stats = tester_stats.get(tester_id, {"tests": [], "last_active": 0})
+    all_tests = stats["tests"]
+    monthly_tests = [t for t in all_tests if t[0] >= month_ago]
+
+    durations = [t[1] for t in all_tests if t[1] > 0]
+    avg_duration = sum(durations) / len(durations) if durations else 0
+
+    return {
+        "total": len(all_tests),
+        "monthly": len(monthly_tests),
+        "avg_duration": avg_duration,
+        "last_active": stats["last_active"],
+    }
+
 
 async def fetch_minecraft_skin(ign: str) -> str:
     """
@@ -242,26 +326,44 @@ def get_gamemode_display(gamemode: str) -> str:
     return next((gm for gm in GAMEMODES if gm.lower() == gamemode.lower()), gamemode)
 
 
-def create_closed_queue_embed(gamemode: str, region: str) -> discord.Embed:
-    """Create a CLOSED queue panel embed."""
+def create_closed_queue_embed(gamemode: str, region: str = None) -> discord.Embed:
+    """Create a premium CLOSED queue panel embed."""
     gamemode_display = get_gamemode_display(gamemode)
 
     embed = discord.Embed(
         title=f"🔒 {gamemode_display} Queue Closed",
-        description="This testing session has ended.\nYou will be notified here when a new queue opens.",
-        color=discord.Color.dark_gray(),
+        description=(
+            "This testing session has officially ended.\n"
+            "No testers are currently online.\n\n"
+            "You will be notified in this channel when a new queue opens.\n"
+            "Please stay patient and avoid unnecessary pings."
+        ),
+        color=discord.Color.dark_red(),
     )
+
+    # Closure Details Section
     embed.add_field(
-        name="📋 Reason",
-        value="Manually closed by queue administrator",
+        name="━━━━━━━━━━━━━━━━━━━━━━",
+        value="📄 **Closure Details**",
         inline=False,
     )
+
+    embed.add_field(
+        name="📝 Reason",
+        value="Manually closed by queue administrator",
+        inline=True,
+    )
+
     embed.add_field(
         name="⏰ Session Ended",
         value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:F>",
-        inline=False,
+        inline=True,
     )
-    embed.set_footer(text=f"Thank you for testing! | 🌍 Region: {region}")
+
+    # Footer with branding
+    embed.set_footer(
+        text="Thank you for testing with us.\nWe value fair play, patience, and discipline.\n\nPowered by 🌑 Lunar Tierlist"
+    )
 
     return embed
 
@@ -323,6 +425,16 @@ async def create_queue_embed(guild: discord.Guild, gamemode: str, region: str) -
         return create_open_queue_embed(guild, gamemode, region)
     else:
         return create_closed_queue_embed(gamemode, region)
+
+
+def get_queue_view(gamemode: str, region: str):
+    """Get appropriate view based on queue state. Returns None for closed queues."""
+    testers = get_active_testers(gamemode, region)
+    if testers:
+        return QueueView(gamemode, region, disabled=False)
+    else:
+        # No buttons for closed queue - clean static panel
+        return None
 
 
 class QueueView(ui.View):
@@ -541,6 +653,9 @@ class ResultModal(ui.Modal, title="Submit Tier Result"):
         # Update cooldown
         result_cooldowns[self.tester.id] = time.time()
 
+        # Record test for tester stats
+        record_test(self.tester.id, duration=0)
+
         # Create result embed
         result_embed = discord.Embed(
             title=f"{ign}'s Tier Update 🏆",
@@ -733,6 +848,15 @@ async def start_queue(interaction: discord.Interaction, gamemode: str, region: s
     """Start a queue for a gamemode and region."""
     gamemode_display = get_gamemode_display(gamemode)
 
+    # Check restriction
+    restricted, days_left = is_tester_restricted(interaction.user.id)
+    if restricted:
+        await interaction.response.send_message(
+            f"❌ You are temporarily restricted due to strikes. ({days_left} day(s) left)",
+            ephemeral=True,
+        )
+        return
+
     # Check tester role
     if not has_tester_role(interaction.user, gamemode_display):
         await interaction.response.send_message(
@@ -830,9 +954,8 @@ async def end_queue(interaction: discord.Interaction, gamemode: str, region: str
             try:
                 msg = await channel.fetch_message(panel_msg_id)
                 embed = await create_queue_embed(interaction.guild, gamemode, region)
-                # Disable buttons if no testers left
-                is_closed = len(get_active_testers(gamemode, region)) == 0
-                view = QueueView(gamemode.lower(), region, disabled=is_closed)
+                # No buttons for closed queue - clean static panel
+                view = get_queue_view(gamemode, region)
                 await msg.edit(content=None, embed=embed, view=view)
             except discord.NotFound:
                 pass
@@ -906,6 +1029,15 @@ async def pull_user(
     gm = gamemode.value
     reg = region.value
     gamemode_display = get_gamemode_display(gm)
+
+    # Check restriction
+    restricted, days_left = is_tester_restricted(interaction.user.id)
+    if restricted:
+        await interaction.response.send_message(
+            f"❌ You are temporarily restricted due to strikes. ({days_left} day(s) left)",
+            ephemeral=True,
+        )
+        return
 
     # Check tester role
     if not has_tester_role(interaction.user, gamemode_display):
@@ -1131,12 +1263,11 @@ async def initialize_queue_panels(guild: discord.Guild):
             if key in queue_panel_messages:
                 continue
 
-            # Create closed panel
+            # Create closed panel with NO buttons
             embed = create_closed_queue_embed(gm, reg)
-            view = QueueView(gm.lower(), reg, disabled=True)
 
             try:
-                msg = await channel.send(embed=embed, view=view)
+                msg = await channel.send(embed=embed, view=None)
                 queue_panel_messages[key] = msg.id
                 print(f"Created panel for {gm} ({reg}) in #{channel_name}")
             except discord.Forbidden:
@@ -1309,13 +1440,13 @@ async def force_close(
     if channel:
         key = get_queue_key(gm, reg)
         embed = create_closed_queue_embed(gm, reg)
-        view = QueueView(gm, reg, disabled=True)
+        # No buttons for closed queue - clean static panel
 
         panel_msg_id = queue_panel_messages.get(key)
         if panel_msg_id:
             try:
                 msg = await channel.fetch_message(panel_msg_id)
-                await msg.edit(content=None, embed=embed, view=view)
+                await msg.edit(content=None, embed=embed, view=None)
             except discord.NotFound:
                 pass
 
@@ -1361,8 +1492,8 @@ async def clear_queue_cmd(
             try:
                 msg = await channel.fetch_message(panel_msg_id)
                 embed = await create_queue_embed(interaction.guild, gm, reg)
-                testers = get_active_testers(gm, reg)
-                view = QueueView(gm, reg, disabled=len(testers) == 0)
+                # Use appropriate view based on queue state
+                view = get_queue_view(gm, reg)
                 await msg.edit(embed=embed, view=view)
             except discord.NotFound:
                 pass
@@ -1384,6 +1515,15 @@ async def submit_result(interaction: discord.Interaction, gamemode: app_commands
     """Open result submission modal for a completed test."""
     gm = gamemode.value
     gamemode_display = get_gamemode_display(gm)
+
+    # Check restriction
+    restricted, days_left = is_tester_restricted(interaction.user.id)
+    if restricted:
+        await interaction.response.send_message(
+            f"❌ You are temporarily restricted due to strikes. ({days_left} day(s) left)",
+            ephemeral=True,
+        )
+        return
 
     # Check permission
     can_submit, error_msg = can_submit_result(interaction.user, gm)
@@ -1426,6 +1566,146 @@ async def set_results_channel(interaction: discord.Interaction, channel: discord
 
     await interaction.response.send_message(
         f"✅ Results will now be posted to {channel.mention}",
+        ephemeral=True,
+    )
+
+
+# ============================================================
+# STRIKE SYSTEM COMMANDS
+# ============================================================
+
+@bot.tree.command(name="strike", description="[Admin] Issue a strike to a tester")
+@app_commands.describe(tester="The tester to strike", reason="Reason for the strike")
+async def strike_tester(
+    interaction: discord.Interaction,
+    tester: discord.Member,
+    reason: str,
+):
+    """Issue a strike to a tester."""
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Only Admin / Head Tester can issue strikes.", ephemeral=True)
+        return
+
+    if tester.id == interaction.user.id:
+        await interaction.response.send_message("❌ You cannot strike yourself.", ephemeral=True)
+        return
+
+    strike_count = add_strike(tester.id, reason, interaction.user.id)
+
+    embed = discord.Embed(
+        title="⚠️ Strike Issued",
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name="Tester", value=tester.mention, inline=True)
+    embed.add_field(name="Strike Count", value=f"{strike_count}/{MAX_STRIKES}", inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.add_field(name="Issued By", value=interaction.user.mention, inline=True)
+
+    if strike_count >= MAX_STRIKES:
+        embed.add_field(
+            name="🚫 RESTRICTED",
+            value=f"{tester.mention} is now restricted for {RESTRICTION_DAYS} days.",
+            inline=False,
+        )
+        embed.color = discord.Color.red()
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="strikes", description="View strikes for a tester")
+@app_commands.describe(tester="The tester to check")
+async def view_strikes(interaction: discord.Interaction, tester: discord.Member):
+    """View strike history for a tester."""
+    strikes = tester_strikes.get(tester.id, [])
+    restricted, days_left = is_tester_restricted(tester.id)
+
+    embed = discord.Embed(
+        title=f"📋 Strikes for {tester.display_name}",
+        color=discord.Color.red() if restricted else discord.Color.blue(),
+    )
+
+    if restricted:
+        embed.add_field(
+            name="🚫 Status",
+            value=f"RESTRICTED ({days_left} day(s) remaining)",
+            inline=False,
+        )
+
+    embed.add_field(name="Total Strikes", value=f"{len(strikes)}/{MAX_STRIKES}", inline=True)
+
+    if strikes:
+        strike_list = []
+        for i, s in enumerate(strikes[-5:], 1):  # Show last 5
+            timestamp = f"<t:{int(s['timestamp'])}:R>"
+            strike_list.append(f"`{i}.` {s['reason']} — {timestamp}")
+        embed.add_field(name="Recent Strikes", value="\n".join(strike_list), inline=False)
+    else:
+        embed.add_field(name="Recent Strikes", value="*No strikes*", inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="tester-report", description="View tester statistics")
+@app_commands.describe(tester="The tester to check")
+async def tester_report(interaction: discord.Interaction, tester: discord.Member):
+    """View detailed tester statistics."""
+    stats = get_tester_stats(tester.id)
+    strikes = tester_strikes.get(tester.id, [])
+    restricted, days_left = is_tester_restricted(tester.id)
+
+    embed = discord.Embed(
+        title=f"📊 Tester Report: {tester.display_name}",
+        color=discord.Color.red() if restricted else discord.Color.blue(),
+    )
+
+    # Status
+    if restricted:
+        status = f"🚫 Restricted ({days_left} day(s) left)"
+    else:
+        status = "✅ Active"
+    embed.add_field(name="Status", value=status, inline=True)
+
+    # Tests
+    embed.add_field(name="Total Tests", value=str(stats["total"]), inline=True)
+    embed.add_field(name="Tests This Month", value=f"{stats['monthly']}/30", inline=True)
+
+    # Average duration
+    if stats["avg_duration"] > 0:
+        avg_min = int(stats["avg_duration"] // 60)
+        avg_sec = int(stats["avg_duration"] % 60)
+        embed.add_field(name="Avg Test Duration", value=f"{avg_min}m {avg_sec}s", inline=True)
+    else:
+        embed.add_field(name="Avg Test Duration", value="N/A", inline=True)
+
+    # Last active
+    if stats["last_active"] > 0:
+        embed.add_field(name="Last Active", value=f"<t:{int(stats['last_active'])}:R>", inline=True)
+    else:
+        embed.add_field(name="Last Active", value="Never", inline=True)
+
+    # Strikes
+    embed.add_field(name="Strike Count", value=f"{len(strikes)}/{MAX_STRIKES}", inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="remove-strike", description="[Admin] Remove a strike from a tester")
+@app_commands.describe(tester="The tester")
+async def remove_strike(interaction: discord.Interaction, tester: discord.Member):
+    """Remove the most recent strike from a tester."""
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+        return
+
+    strikes = tester_strikes.get(tester.id, [])
+    if not strikes:
+        await interaction.response.send_message(f"❌ {tester.mention} has no strikes.", ephemeral=True)
+        return
+
+    removed = strikes.pop()
+    await interaction.response.send_message(
+        f"✅ Removed strike from {tester.mention}. Reason was: `{removed['reason']}`\n"
+        f"Remaining strikes: {len(strikes)}/{MAX_STRIKES}",
         ephemeral=True,
     )
 
